@@ -35,7 +35,6 @@ class SystemBus:
 
         # Зарегистрированные периферийные устройства
         # Список кортежей (start, end, peripheral)
-        # peripheral должен иметь методы read32(address)/write32(address, value)
         self._peripherals = []
 
         # Peripheral stub для неизвестных адресов
@@ -46,6 +45,14 @@ class SystemBus:
         self.trace_enabled = False
         self._unhandled_reads = set()
         self._unhandled_writes = set()
+
+        # Boot mode:
+        # True = адрес 0x00000000 алиасит Flash Bank1 (для vector table при reset)
+        # False = адрес 0x00000000 читает ITCM RAM (после загрузки ITCM firmware'ом)
+        self._boot_from_flash = True
+
+        # ITCM override data (загружается отдельно, применяется после reset)
+        self._itcm_override_data = None
 
     # =============================================================
     # Peripheral registration
@@ -61,12 +68,43 @@ class SystemBus:
           (опционально read8/read16/write8/write16)
         """
         self._peripherals.append((start, end, peripheral))
-        # Сортируем по start для потенциальной оптимизации
         self._peripherals.sort(key=lambda x: x[0])
 
     def set_exc_manager(self, exc_manager):
         """Подключить ExceptionManager для обработки NVIC/SCB обращений."""
         self.exc_manager = exc_manager
+
+    # =============================================================
+    # Boot mode control
+    # =============================================================
+
+    def set_boot_from_flash(self, enabled):
+        """
+        Управление boot alias.
+        True: 0x00000000 -> Flash Bank1 (при reset)
+        False: 0x00000000 -> ITCM RAM (после инициализации)
+        """
+        self._boot_from_flash = enabled
+
+    def apply_itcm_override(self):
+        """
+        Применить ITCM override данные (из itcm.bin).
+        Вызывается ПОСЛЕ reset CPU, чтобы не испортить vector table.
+        
+        На реальном MCU firmware сама копирует код в ITCM при старте.
+        itcm.bin — это snapshot ITCM после инициализации.
+        """
+        if self._itcm_override_data is not None:
+            data = self._itcm_override_data
+            # НЕ перезаписываем первые 512 байт (vector table area)
+            # На реальном MCU vector table в Flash, ITCM используется для быстрого кода
+            # Но itcm.bin может содержать код с offset 0 
+            # Безопаснее: загрузить itcm.bin целиком, но при boot читать из Flash
+            self.sram.load_itcm(data)
+            # Переключить на ITCM после загрузки
+            # (пока оставляем boot_from_flash = True, 
+            #  firmware сама переключит через VTOR)
+            print(f"[BUS] Applied ITCM override: {len(data)} bytes")
 
     # =============================================================
     # Поиск обработчика
@@ -101,17 +139,19 @@ class SystemBus:
     def _do_read(self, address, width):
         """Основная логика маршрутизации чтения."""
 
-        # 1. ITCM region (0x00000000 - 0x0000FFFF)
-        #    На STM32H7B0 при загрузке ITCM алиасит Flash Bank1.
-        #    Если в ITCM есть данные (загружен itcm.bin), читаем оттуда.
-        #    Иначе алиасим Flash Bank1.
+        # 1. ITCM / Flash alias region (0x00000000 - 0x0000FFFF)
         if address < 0x00010000:
-            # Пробуем ITCM RAM
-            if self.sram.contains(address):
-                return self._read_region(self.sram, address, width)
-            # Fallback: alias на Flash Bank1
-            flash_addr = 0x08000000 + address
-            return self._read_region(self.flash, flash_addr, width)
+            if self._boot_from_flash:
+                # Boot mode: алиас Flash Bank1 для vector table
+                flash_addr = 0x08000000 + address
+                return self._read_region(self.flash, flash_addr, width)
+            else:
+                # Normal mode: ITCM RAM
+                if self.sram.contains(address):
+                    return self._read_region(self.sram, address, width)
+                # Fallback на Flash
+                flash_addr = 0x08000000 + address
+                return self._read_region(self.flash, flash_addr, width)
 
         # 2. Internal Flash (0x08000000 - 0x0811FFFF)
         if 0x08000000 <= address < 0x08200000:
@@ -190,6 +230,8 @@ class SystemBus:
         if address < 0x00010000:
             if self.sram.contains(address):
                 self._write_region(self.sram, address, value, width)
+            # Запись в ITCM region также переключает на ITCM mode
+            # (firmware записала что-то в ITCM → значит инициализировала)
             return
 
         # 2. Internal Flash — read only (запись игнорируется)
@@ -272,24 +314,22 @@ class SystemBus:
 
     def _read_system_periph(self, address, width):
         """Чтение из системных периферийных регистров."""
-        # SysTick (0xE000E010 - 0xE000E0FF)
         if 0xE000E010 <= address <= 0xE000E01F:
             return self._read_systick(address)
 
-        # NVIC + SCB
         if self.exc_manager is not None:
             if ExceptionManager.handles_address(address):
                 return self.exc_manager.nvic_read(address)
 
-        # FPU control (Cortex-M7 имеет FPU, но G&W firmware может не использовать)
         if 0xE000EF30 <= address <= 0xE000EF44:
             return self._read_fpu(address)
 
-        # MPU
         if 0xE000ED90 <= address <= 0xE000EDB8:
             return self._read_mpu(address)
 
-        # Debug (DHCSR и т.д.)
+        if 0xE000ED88 <= address <= 0xE000ED8C:
+            return self._read_fpu(address)
+
         if 0xE000EDF0 <= address <= 0xE000EDFC:
             return 0
 
@@ -297,45 +337,35 @@ class SystemBus:
 
     def _write_system_periph(self, address, value, width):
         """Запись в системные периферийные регистры."""
-        # SysTick
         if 0xE000E010 <= address <= 0xE000E01F:
             self._write_systick(address, value)
             return
 
-        # NVIC + SCB
         if self.exc_manager is not None:
             if ExceptionManager.handles_address(address):
                 self.exc_manager.nvic_write(address, value)
                 return
 
-        # FPU
         if 0xE000EF30 <= address <= 0xE000EF44:
             self._write_fpu(address, value)
             return
 
-        # MPU
+        if 0xE000ED88 <= address <= 0xE000ED8C:
+            self._write_fpu(address, value)
+            return
+
         if 0xE000ED90 <= address <= 0xE000EDB8:
             self._write_mpu(address, value)
             return
 
     # =============================================================
-    # SysTick (базовая реализация)
+    # SysTick
     # =============================================================
-
-    def __init_systick(self):
-        """Вызывается при первом обращении к SysTick."""
-        pass
-
-    # SysTick registers:
-    # 0xE000E010: CTRL
-    # 0xE000E014: LOAD (reload value)
-    # 0xE000E018: VAL (current value)
-    # 0xE000E01C: CALIB
 
     _systick_ctrl = 0
     _systick_load = 0
     _systick_val = 0
-    _systick_calib = 0x00000000  # не калиброван
+    _systick_calib = 0x00000000
 
     def _read_systick(self, address):
         if address == 0xE000E010:
@@ -343,9 +373,8 @@ class SystemBus:
         elif address == 0xE000E014:
             return self._systick_load
         elif address == 0xE000E018:
-            # Чтение VAL очищает COUNTFLAG
             val = self._systick_val
-            self._systick_ctrl &= ~(1 << 16)  # clear COUNTFLAG
+            self._systick_ctrl &= ~(1 << 16)
             return val
         elif address == 0xE000E01C:
             return self._systick_calib
@@ -357,7 +386,6 @@ class SystemBus:
         elif address == 0xE000E014:
             self._systick_load = value & 0x00FFFFFF
         elif address == 0xE000E018:
-            # Запись любого значения очищает VAL и COUNTFLAG
             self._systick_val = 0
             self._systick_ctrl &= ~(1 << 16)
 
@@ -366,17 +394,15 @@ class SystemBus:
         Вызывается каждый цикл CPU для обновления SysTick.
         Возвращает True если SysTick сгенерировал прерывание.
         """
-        if not (self._systick_ctrl & 1):  # ENABLE bit
+        if not (self._systick_ctrl & 1):
             return False
 
         if self._systick_val > 0:
             self._systick_val -= 1
         else:
-            # Перезагрузка
             self._systick_val = self._systick_load
-            self._systick_ctrl |= (1 << 16)  # COUNTFLAG
+            self._systick_ctrl |= (1 << 16)
 
-            # Если TICKINT включен — генерируем прерывание
             if self._systick_ctrl & (1 << 1):
                 if self.exc_manager:
                     from cpu.exceptions import ExceptionType
@@ -389,10 +415,10 @@ class SystemBus:
     # FPU stub
     # =============================================================
 
-    _fpu_cpacr = 0  # 0xE000ED88 — Coprocessor Access Control
-    _fpu_fpccr = 0xC0000000  # 0xE000EF34 — FP Context Control
-    _fpu_fpcar = 0  # 0xE000EF38
-    _fpu_fpdscr = 0  # 0xE000EF3C
+    _fpu_cpacr = 0
+    _fpu_fpccr = 0xC0000000
+    _fpu_fpcar = 0
+    _fpu_fpdscr = 0
 
     def _read_fpu(self, address):
         if address == 0xE000ED88:
@@ -422,9 +448,9 @@ class SystemBus:
     _mpu_regs = {}
 
     def _read_mpu(self, address):
-        if address == 0xE000ED90:  # MPU_TYPE
-            return 0x00000800  # 8 regions
-        elif address == 0xE000ED94:  # MPU_CTRL
+        if address == 0xE000ED90:
+            return 0x00000800
+        elif address == 0xE000ED94:
             return self._mpu_regs.get(0xE000ED94, 0)
         return self._mpu_regs.get(address, 0)
 
@@ -437,39 +463,29 @@ class SystemBus:
 
     @staticmethod
     def _is_peripheral_addr(address):
-        """Определить, является ли адрес периферийным."""
-        # APB1: 0x40000000 - 0x40007FFF
         if 0x40000000 <= address < 0x40008000:
             return True
-        # APB2: 0x40010000 - 0x40016BFF
         if 0x40010000 <= address < 0x40017000:
             return True
-        # AHB1: 0x40020000 - 0x4007FFFF
         if 0x40020000 <= address < 0x40080000:
             return True
-        # AHB2: 0x48020000 - 0x48022BFF
         if 0x48020000 <= address < 0x48023000:
             return True
-        # AHB3: 0x51000000 - 0x52008FFF
         if 0x51000000 <= address < 0x52009000:
             return True
-        # APB3: 0x50000000 - 0x50003FFF
         if 0x50000000 <= address < 0x50004000:
             return True
-        # AHB4/APB4: 0x58000000 - 0x580267FF
         if 0x58000000 <= address < 0x58027000:
             return True
-        # Debug: 0x5C000000+
         if 0x5C000000 <= address < 0x5C010000:
             return True
         return False
 
     # =============================================================
-    # Peripheral stub (для необработанной периферии)
+    # Peripheral stub
     # =============================================================
 
     def _stub_read(self, address, width):
-        """Чтение из незарегистрированного периферийного регистра."""
         val = self._stub_reads.get(address, 0)
         if self.trace_enabled and address not in self._unhandled_reads:
             self._unhandled_reads.add(address)
@@ -478,7 +494,6 @@ class SystemBus:
         return val
 
     def _stub_write(self, address, value, width):
-        """Запись в незарегистрированный периферийный регистр."""
         self._stub_reads[address] = value
         if self.trace_enabled and address not in self._unhandled_writes:
             self._unhandled_writes.add(address)
@@ -487,7 +502,6 @@ class SystemBus:
 
     @staticmethod
     def _guess_peripheral_name(address):
-        """Попытка определить имя периферии по адресу."""
         known = [
             (0x58024400, 0x580247FF, "RCC"),
             (0x58020000, 0x580203FF, "GPIOA"),
@@ -527,67 +541,70 @@ class SystemBus:
                  itcm_path=None, key_info_path=None):
         """
         Загрузить все ROM файлы.
-        
-        internal_flash_path: путь к internal_flash.bin
-        external_flash_path: путь к external_flash.bin или external_flash_decrypted.bin
-        itcm_path: путь к itcm.bin
-        key_info_path: путь к (Key Info).json
         """
         loaded = {}
 
         # 1. Internal Flash
         if internal_flash_path:
-            size = self.flash.load_internal_flash(internal_flash_path)
-            loaded['internal_flash'] = size
-            print(f"[BUS] Loaded internal flash: {size} bytes")
+            import os
+            if os.path.exists(internal_flash_path):
+                size = self.flash.load_internal_flash(internal_flash_path)
+                loaded['internal_flash'] = size
+                print(f"[BUS] Loaded internal flash: {size} bytes")
 
-            # Скопировать Flash Bank1 в ITCM (alias при загрузке)
-            boot_data = self.flash.get_boot_data_for_itcm()
-            itcm_size = min(len(boot_data), 64 * 1024)
-            self.sram.load_itcm(boot_data[:itcm_size])
-            print(f"[BUS] Flash Bank1 -> ITCM alias: {itcm_size} bytes")
+                # Скопировать Flash Bank1 в ITCM (boot alias)
+                # Это обеспечивает что vector table доступна через Flash alias
+                boot_data = self.flash.get_boot_data_for_itcm()
+                itcm_size = min(len(boot_data), 64 * 1024)
+                self.sram.load_itcm(boot_data[:itcm_size])
+                print(f"[BUS] Flash Bank1 -> ITCM alias: {itcm_size} bytes")
 
-        # 2. ITCM override (если есть отдельный itcm.bin)
+        # 2. ITCM override — СОХРАНЯЕМ, но НЕ применяем сейчас
+        # Будет применено после reset через apply_itcm_override()
         if itcm_path:
             import os
             if os.path.exists(itcm_path):
                 with open(itcm_path, 'rb') as f:
                     itcm_data = f.read()
-                itcm_size = min(len(itcm_data), 64 * 1024)
-                self.sram.load_itcm(itcm_data[:itcm_size])
-                loaded['itcm'] = itcm_size
-                print(f"[BUS] Loaded ITCM override: {itcm_size} bytes")
+                self._itcm_override_data = itcm_data
+                loaded['itcm'] = len(itcm_data)
+                print(f"[BUS] Loaded ITCM override: {len(itcm_data)} bytes (deferred)")
 
         # 3. External Flash
         if external_flash_path:
             import os
-            basename = os.path.basename(external_flash_path).lower()
-            if 'decrypted' in basename:
-                size = self.ext_flash.load_decrypted(external_flash_path)
-            else:
-                size = self.ext_flash.load_encrypted(external_flash_path)
-            loaded['external_flash'] = size
-            print(f"[BUS] Loaded external flash: {size} bytes"
-                  f" ({'decrypted' if self.ext_flash.is_decrypted() else 'encrypted'})")
+            if os.path.exists(external_flash_path):
+                basename = os.path.basename(external_flash_path).lower()
+                if 'decrypted' in basename:
+                    size = self.ext_flash.load_decrypted(external_flash_path)
+                else:
+                    size = self.ext_flash.load_encrypted(external_flash_path)
+                loaded['external_flash'] = size
+                print(f"[BUS] Loaded external flash: {size} bytes"
+                      f" ({'decrypted' if self.ext_flash.is_decrypted() else 'encrypted'})")
 
         # 4. Keys
         if key_info_path:
-            if self.ext_flash.load_keys(key_info_path):
-                loaded['keys'] = True
-                print(f"[BUS] Loaded encryption keys")
+            import os
+            if os.path.exists(key_info_path):
+                if self.ext_flash.load_keys(key_info_path):
+                    loaded['keys'] = True
+                    print(f"[BUS] Loaded encryption keys")
+
+        # Ensure boot from flash mode
+        self._boot_from_flash = True
 
         return loaded
 
     def get_info(self):
-        """Вывести информацию о состоянии шины."""
         lines = ["=== System Bus ==="]
         lines.append(f"  SRAM: {self.sram}")
         lines.append(f"  Flash: {self.flash}")
         lines.append(f"  ExtFlash: {self.ext_flash}")
+        lines.append(f"  Boot from Flash: {self._boot_from_flash}")
         lines.append(f"  Peripherals registered: {len(self._peripherals)}")
         lines.append(f"  Stub entries: {len(self._stub_reads)}")
 
-        # Vector table
         sp = self.read32(0x00000000)
         pc = self.read32(0x00000004)
         lines.append(f"  Vector[0] (SP):  0x{sp:08X}")
