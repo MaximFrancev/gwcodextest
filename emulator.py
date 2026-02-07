@@ -1,15 +1,17 @@
 import argparse
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Set
+from typing import Iterable, List, Set
 import tkinter as tk
+
+from gwemu import CortexMEmulator, build_default_memory
 
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
 TARGET_FPS = 30
+CYCLES_PER_FRAME = 200
 
 
 BUTTON_KEYMAP = {
@@ -114,6 +116,9 @@ class EmulatorApp:
         self.frame_index = 0
         self.last_frame_time = time.monotonic()
 
+        self.cpu = CortexMEmulator(build_default_memory(rom_data))
+        self.cpu.reset()
+
         self.header_label = tk.Label(
             self.root,
             text=f"ROM: {metadata.name} ({metadata.size} bytes)",
@@ -130,7 +135,16 @@ class EmulatorApp:
             bg="#111",
             font=("Helvetica", 10),
         )
-        self.status_label.pack(pady=(0, 8))
+        self.status_label.pack(pady=(0, 2))
+
+        self.cpu_label = tk.Label(
+            self.root,
+            text="CPU: PC=0x00000000",
+            fg="#a7d7ff",
+            bg="#111",
+            font=("Helvetica", 10),
+        )
+        self.cpu_label.pack(pady=(0, 8))
 
         self.photo = tk.PhotoImage(width=SCREEN_WIDTH, height=SCREEN_HEIGHT)
         self.canvas = tk.Canvas(
@@ -141,7 +155,7 @@ class EmulatorApp:
             bg="#000",
         )
         self.canvas.pack(padx=12, pady=12)
-        self.image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
 
         self.visualizer = RomVisualizer(self.rom_data, SCREEN_WIDTH, SCREEN_HEIGHT)
 
@@ -168,9 +182,21 @@ class EmulatorApp:
         elapsed = now - self.last_frame_time
         target_delta = 1 / TARGET_FPS
         if elapsed >= target_delta:
+            self.run_cpu_slice()
             self.render_frame()
             self.last_frame_time = now
         self.root.after(1, self.tick)
+
+    def run_cpu_slice(self) -> None:
+        for _ in range(CYCLES_PER_FRAME):
+            if self.cpu.halted:
+                break
+            try:
+                self.cpu.step()
+            except NotImplementedError:
+                self.cpu.halted = True
+                break
+        self.cpu_label.configure(text=f"CPU: PC=0x{self.cpu.pc:08X}")
 
     def render_frame(self) -> None:
         rows = self.visualizer.frame_rows(self.frame_index, self.input_state.pressed)

@@ -1,13 +1,15 @@
 # Game & Watch (2020) Emulator Prototype
 
-This repository contains a lightweight Python prototype that provides a **visual shell** for a
-Nintendo Game & Watch (2020) emulator. It is *not* a cycle-accurate emulator yet, but it lets you
-load ROM dumps, map controller input to the keyboard, and visualize ROM data on a 320×240 screen
-surface so you can start experimenting with input handling and display output.
+This repository contains a lightweight Python prototype that provides a **visual shell** and a
+starter **Cortex-M7 CPU emulator** for a Nintendo Game & Watch (2020) emulator. It is *not* a
+cycle-accurate emulator yet, but it lets you load ROM dumps, map controller input to the keyboard,
+step real CPU instructions, and visualize ROM data on a 320×240 screen surface so you can start
+experimenting with input handling and display output.
 
 ## What this prototype does
 
 - Loads a ROM `.bin` file (or scans the `roms/` directory by default).
+- Boots a minimal ARM Thumb CPU interpreter (MOV/ADD/SUB/LDR/B/BX/BKPT) from the ROM vector table.
 - Opens a 320×240 window that acts as the LCD screen.
 - Maps Game & Watch buttons to keyboard keys (see below).
 - Renders a deterministic color pattern based on ROM bytes, so you have immediate visual feedback
@@ -41,11 +43,17 @@ python emulator.py --rom roms/mario/internal_flash.bin
 python emulator.py --rom roms/zelda
 ```
 
+## Running tests
+
+```bash
+python -m unittest
+```
+
 ## Next steps for a real emulator
 
-This shell is a starting point. To move toward a real emulator, you can layer in:
+This shell is a starting point. To move toward a full emulator, you can layer in:
 
-1. ARM Cortex-M7 CPU emulation (instruction decode + execution).
+1. ARM Cortex-M7 CPU emulation (instruction decode + execution coverage, exceptions, timers).
 2. Memory map definitions for internal/external flash, SRAM, and peripherals.
 3. GPIO input handling (from the keyboard) mapped to STM32 registers.
 4. A proper LCD controller implementation that uses real framebuffer data.
