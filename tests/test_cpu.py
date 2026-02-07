@@ -78,6 +78,21 @@ class CortexMEmulatorTests(unittest.TestCase):
         self.assertEqual(cpu.regs[0], 1)
         self.assertEqual(cpu.regs[1], 2)
 
+    def test_shift_immediate(self) -> None:
+        program = bytearray()
+        program += (0x20001000).to_bytes(4, "little")
+        program += (FLASH_BASE + 8).to_bytes(4, "little")
+        program += (0x2008).to_bytes(2, "little")  # MOVS r0, #8
+        program += (0x00C1).to_bytes(2, "little")  # LSLS r1, r0, #3
+        program += (0x0842).to_bytes(2, "little")  # LSRS r2, r0, #1
+        program += (0x10C3).to_bytes(2, "little")  # ASRS r3, r0, #3
+        program += (0xBE00).to_bytes(2, "little")
+
+        cpu = self._run(program)
+        self.assertEqual(cpu.regs[1], 64)
+        self.assertEqual(cpu.regs[2], 4)
+        self.assertEqual(cpu.regs[3], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

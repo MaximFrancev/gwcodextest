@@ -52,6 +52,28 @@ class CortexMEmulator:
         if instr == 0xBE00:
             self.halted = True
             return
+        if instr & 0xE000 == 0x0000:
+            imm5 = (instr >> 6) & 0x1F
+            rm = (instr >> 3) & 0x7
+            rd = instr & 0x7
+            if instr & 0x1800 == 0x0000:
+                self.regs[rd] = (self.regs[rm] << imm5) & 0xFFFFFFFF
+                self._set_flags_nz(self.regs[rd])
+                return
+            if instr & 0x1800 == 0x0800:
+                shift = imm5 or 32
+                self.regs[rd] = (self.regs[rm] >> shift) & 0xFFFFFFFF
+                self._set_flags_nz(self.regs[rd])
+                return
+            if instr & 0x1800 == 0x1000:
+                shift = imm5 or 32
+                value = self.regs[rm]
+                if value & 0x80000000:
+                    self.regs[rd] = ((value >> shift) | (0xFFFFFFFF << (32 - shift))) & 0xFFFFFFFF
+                else:
+                    self.regs[rd] = (value >> shift) & 0xFFFFFFFF
+                self._set_flags_nz(self.regs[rd])
+                return
         if instr & 0xF800 == 0x2000:
             rd = (instr >> 8) & 0x7
             imm8 = instr & 0xFF
