@@ -165,7 +165,7 @@ class LTDC:
 
         # VSYNC счётчик для синхронизации
         self._vsync_count = 0
-        self._line_count = 0
+        self._tick_count = 0
 
         self.reset()
 
@@ -302,18 +302,16 @@ class LTDC:
         # Bit 3: HSYNCS (horizontal sync)
         return 0x0000000F  # Всё активно
 
-    def tick(self):
+    def tick(self, cycles=1, cycles_per_vsync=4096):
         """
         Вызывается периодически для генерации VSYNC прерывания.
         Возвращает True если произошёл VSYNC.
         """
-        self._line_count += 1
+        self._tick_count += max(int(cycles), 1)
 
-        # Эмулируем ~60fps: VSYNC каждые ~N строк
-        # При 280MHz CPU и 60fps это ~4.6M циклов/кадр
-        # Для простоты — VSYNC каждые 4096 тиков
-        if self._line_count >= 4096:
-            self._line_count = 0
+        # Эмулируем ~60fps: VSYNC каждые cycles_per_vsync CPU cycles.
+        if self._tick_count >= cycles_per_vsync:
+            self._tick_count = 0
             self._vsync_count += 1
 
             ier = self._regs.get(self.IER, 0)

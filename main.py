@@ -440,6 +440,9 @@ def main():
                     for tname in ('tim1', 'tim2', 'tim3'):
                         periphs[tname].tick(64)
 
+                # Tick LTDC to generate VSYNC/line flags
+                ltdc.tick(cycles, cycles_per_vsync=cpf)
+
                 # Max cycles check
                 if 0 < config.max_instructions <= total_cycles:
                     logger.info("RUN", f"Max cycles reached: {total_cycles}")
