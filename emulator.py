@@ -5,13 +5,13 @@ from pathlib import Path
 from typing import Iterable, List, Set
 import tkinter as tk
 
-from gwemu import CortexMEmulator, build_default_memory
+from gwemu import CortexMEmulator, build_default_memory, find_rom_root, load_rom_set
 
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
 TARGET_FPS = 30
-CYCLES_PER_FRAME = 200
+CYCLES_PER_FRAME = 500
 
 
 BUTTON_KEYMAP = {
@@ -106,7 +106,7 @@ class RomVisualizer:
 
 
 class EmulatorApp:
-    def __init__(self, rom_data: bytes, metadata: RomMetadata) -> None:
+    def __init__(self, rom_data: bytes, metadata: RomMetadata, rom_root: Path) -> None:
         self.rom_data = rom_data
         self.metadata = metadata
         self.input_state = InputState()
@@ -117,7 +117,14 @@ class EmulatorApp:
         self.last_frame_time = time.monotonic()
         self.last_error: str | None = None
 
-        self.cpu = CortexMEmulator(build_default_memory(rom_data))
+        rom_set = load_rom_set(rom_root)
+        self.cpu = CortexMEmulator(
+            build_default_memory(
+                rom_set.internal_flash,
+                external_flash=rom_set.external_flash,
+                itcm=rom_set.itcm,
+            )
+        )
         self.cpu.reset()
 
         self.header_label = tk.Label(
@@ -229,18 +236,13 @@ def find_default_rom(rom_root: Path) -> Path:
     if rom_root.is_file():
         return rom_root
 
-    candidates = list(rom_root.glob("**/*.bin"))
+    candidates = list(rom_root.glob("**/internal_flash.bin"))
     if not candidates:
         raise FileNotFoundError(
-            f"No .bin ROMs found under {rom_root}. Provide a ROM path."
+            f"No internal_flash.bin found under {rom_root}. Provide a ROM path."
         )
 
-    preferred = [
-        path
-        for path in candidates
-        if path.name in {"internal_flash.bin", "external_flash.bin"}
-    ]
-    return (preferred or candidates)[0]
+    return candidates[0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -262,8 +264,9 @@ def main() -> None:
     loader = RomLoader(rom_path)
     rom_data = loader.load()
     metadata = loader.describe()
+    rom_root = find_rom_root(Path(args.rom))
 
-    app = EmulatorApp(rom_data, metadata)
+    app = EmulatorApp(rom_data, metadata, rom_root)
     app.run()
 
 

@@ -8,8 +8,8 @@ experimenting with input handling and display output.
 
 ## What this prototype does
 
-- Loads a ROM `.bin` file (or scans the `roms/` directory by default).
-- Boots a minimal ARM Thumb CPU interpreter (MOV/ADD/SUB/LDR/B/BX/BKPT) from the ROM vector table.
+- Loads ROM dumps (`internal_flash.bin`, `external_flash.bin`, `itcm.bin`) from a ROM folder.
+- Boots a minimal ARM Thumb CPU interpreter with a growing instruction set.
 - Opens a 320×240 window that acts as the LCD screen.
 - Maps Game & Watch buttons to keyboard keys (see below).
 - Renders a deterministic color pattern based on ROM bytes, so you have immediate visual feedback
@@ -36,26 +36,26 @@ experimenting with input handling and display output.
 python emulator.py
 ```
 
-To load a specific ROM file or directory:
+To load a specific ROM folder or file:
 
 ```bash
+python emulator.py --rom roms/mario
 python emulator.py --rom roms/mario/internal_flash.bin
-python emulator.py --rom roms/zelda
 ```
 
 ## Running tests
 
 ```bash
-python -m unittest
+python -m unittest discover -s tests
 ```
 
 ## Next steps for a real emulator
 
 This shell is a starting point. To move toward a full emulator, you can layer in:
 
-1. ARM Cortex-M7 CPU emulation (instruction decode + execution coverage, exceptions, timers).
-2. Memory map definitions for internal/external flash, SRAM, and peripherals.
-3. GPIO input handling (from the keyboard) mapped to STM32 registers.
+1. More Thumb/Thumb-2 instruction coverage and exception handling.
+2. Peripheral modeling (GPIO, timers, interrupts, display controller, SPI flash).
+3. Input handling (from the keyboard) mapped to STM32 registers.
 4. A proper LCD controller implementation that uses real framebuffer data.
 
 The documentation in `docs/` should help map the hardware details as you implement each subsystem.
