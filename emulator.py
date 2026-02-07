@@ -115,6 +115,7 @@ class EmulatorApp:
         self.root.configure(background="#111")
         self.frame_index = 0
         self.last_frame_time = time.monotonic()
+        self.last_error: str | None = None
 
         self.cpu = CortexMEmulator(build_default_memory(rom_data))
         self.cpu.reset()
@@ -144,7 +145,18 @@ class EmulatorApp:
             bg="#111",
             font=("Helvetica", 10),
         )
-        self.cpu_label.pack(pady=(0, 8))
+        self.cpu_label.pack(pady=(0, 2))
+
+        self.error_label = tk.Label(
+            self.root,
+            text="",
+            fg="#ffb0b0",
+            bg="#111",
+            font=("Helvetica", 9),
+            wraplength=SCREEN_WIDTH,
+            justify="left",
+        )
+        self.error_label.pack(pady=(0, 8))
 
         self.photo = tk.PhotoImage(width=SCREEN_WIDTH, height=SCREEN_HEIGHT)
         self.canvas = tk.Canvas(
@@ -188,15 +200,20 @@ class EmulatorApp:
         self.root.after(1, self.tick)
 
     def run_cpu_slice(self) -> None:
+        if self.cpu.halted:
+            return
         for _ in range(CYCLES_PER_FRAME):
             if self.cpu.halted:
                 break
             try:
                 self.cpu.step()
-            except NotImplementedError:
+            except (NotImplementedError, ValueError) as exc:
                 self.cpu.halted = True
+                self.last_error = str(exc)
                 break
         self.cpu_label.configure(text=f"CPU: PC=0x{self.cpu.pc:08X}")
+        if self.last_error:
+            self.error_label.configure(text=f"CPU halted: {self.last_error}")
 
     def render_frame(self) -> None:
         rows = self.visualizer.frame_rows(self.frame_index, self.input_state.pressed)
