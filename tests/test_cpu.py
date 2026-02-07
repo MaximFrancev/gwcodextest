@@ -93,6 +93,47 @@ class CortexMEmulatorTests(unittest.TestCase):
         self.assertEqual(cpu.regs[2], 4)
         self.assertEqual(cpu.regs[3], 1)
 
+    def test_cmp_immediate(self) -> None:
+        program = bytearray()
+        program += (0x20001000).to_bytes(4, "little")
+        program += (FLASH_BASE + 8).to_bytes(4, "little")
+        program += (0x2005).to_bytes(2, "little")  # MOVS r0, #5
+        program += (0x2803).to_bytes(2, "little")  # CMP r0, #3
+        program += (0xD101).to_bytes(2, "little")  # BNE skip
+        program += (0x2001).to_bytes(2, "little")  # MOVS r0, #1 (should skip)
+        program += (0xBE00).to_bytes(2, "little")
+
+        cpu = self._run(program)
+        self.assertEqual(cpu.regs[0], 5)
+
+    def test_mov_high_register(self) -> None:
+        program = bytearray()
+        program += (0x20001000).to_bytes(4, "little")
+        program += (FLASH_BASE + 8).to_bytes(4, "little")
+        program += (0x2007).to_bytes(2, "little")  # MOVS r0, #7
+        program += (0x4680).to_bytes(2, "little")  # MOV r8, r0
+        program += (0xBE00).to_bytes(2, "little")
+
+        cpu = self._run(program)
+        self.assertEqual(cpu.regs[8], 7)
+
+    def test_ldm_stm(self) -> None:
+        program = bytearray()
+        program += (SRAM_BASE + 0x100).to_bytes(4, "little")
+        program += (FLASH_BASE + 8).to_bytes(4, "little")
+        program += (0x4803).to_bytes(2, "little")  # LDR r0, [PC, #12]
+        program += (0x2102).to_bytes(2, "little")  # MOVS r1, #2
+        program += (0xC002).to_bytes(2, "little")  # STMIA r0!, {r1}
+        program += (0x4802).to_bytes(2, "little")  # LDR r0, [PC, #8]
+        program += (0xC804).to_bytes(2, "little")  # LDMIA r0!, {r2}
+        program += (0xBE00).to_bytes(2, "little")
+        program += (0xBF00).to_bytes(2, "little")
+        program += (0xBF00).to_bytes(2, "little")
+        program += (SRAM_BASE + 0x80).to_bytes(4, "little")
+
+        cpu = self._run(program)
+        self.assertEqual(cpu.regs[2], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

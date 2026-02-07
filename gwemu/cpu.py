@@ -80,6 +80,12 @@ class CortexMEmulator:
             self.regs[rd] = imm8
             self._set_flags_nz(self.regs[rd])
             return
+        if instr & 0xF800 == 0x2800:
+            rd = (instr >> 8) & 0x7
+            imm8 = instr & 0xFF
+            result = self.regs[rd] - imm8
+            self._set_flags_sub(self.regs[rd], imm8, result)
+            return
         if instr & 0xF800 == 0x3000:
             rd = (instr >> 8) & 0x7
             imm8 = instr & 0xFF
@@ -258,15 +264,45 @@ class CortexMEmulator:
             result = self.regs[rd] - self.regs[rm]
             self._set_flags_sub(self.regs[rd], self.regs[rm], result)
             return
+        if instr & 0xFFC0 == 0x4500:
+            rm = (instr >> 3) & 0xF
+            rd = (instr & 0x7) | ((instr >> 4) & 0x8)
+            result = self.regs[rd] - self.regs[rm]
+            self._set_flags_sub(self.regs[rd], self.regs[rm], result)
+            return
         if instr & 0xFC00 == 0x4400:
             rm = (instr >> 3) & 0xF
             rd = (instr & 0x7) | ((instr >> 4) & 0x8)
             self.regs[rd] = (self.regs[rd] + self.regs[rm]) & 0xFFFFFFFF
             return
+        if instr & 0xFFC0 == 0x4600:
+            rm = (instr >> 3) & 0xF
+            rd = (instr & 0x7) | ((instr >> 4) & 0x8)
+            if rd == 15:
+                self.pc = self.regs[rm] & ~1
+            else:
+                self.regs[rd] = self.regs[rm]
+            return
         if instr & 0xFF87 == 0x4700:
             rm = (instr >> 3) & 0xF
             target = self.regs[rm]
             self.pc = target & ~1
+            return
+        if instr & 0xF000 == 0xC000:
+            rn = (instr >> 8) & 0x7
+            register_list = instr & 0xFF
+            address = self.regs[rn]
+            if instr & 0x0800:
+                for reg in range(8):
+                    if register_list & (1 << reg):
+                        self.regs[reg] = self.memory.read32(address)
+                        address = (address + 4) & 0xFFFFFFFF
+            else:
+                for reg in range(8):
+                    if register_list & (1 << reg):
+                        self.memory.write32(address, self.regs[reg])
+                        address = (address + 4) & 0xFFFFFFFF
+            self.regs[rn] = address
             return
         if instr & 0xFE00 == 0xB400:
             register_list = instr & 0xFF
