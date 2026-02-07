@@ -110,7 +110,6 @@ def setup_peripherals(bus, cpu, config, logger):
     rcc.trace_enabled = trace
     bus.register_peripheral(RCC.BASE, RCC.END, rcc)
     periphs['rcc'] = rcc
-    logger.debug("INIT", f"RCC registered: 0x{RCC.BASE:08X}-0x{RCC.END:08X}")
 
     # --- GPIO ---
     gpio = GPIO()
@@ -118,7 +117,6 @@ def setup_peripherals(bus, cpu, config, logger):
         port.trace_enabled = trace
         bus.register_peripheral(port.base, port.end, port)
     periphs['gpio'] = gpio
-    logger.debug("INIT", "GPIO A-E registered")
 
     # --- PWR ---
     pwr = PWR()
@@ -183,11 +181,9 @@ def setup_peripherals(bus, cpu, config, logger):
     # --- NVIC wrapper ---
     nvic = NVIC(exc_mgr)
     nvic.trace_enabled = trace
-    # NVIC адреса обрабатываются в bus.py через exc_manager,
-    # но регистрируем для явности
     periphs['nvic'] = nvic
 
-    # --- Stubs для часто используемой периферии ---
+    # --- Stubs ---
     stubs = [
         ("SYSCFG",  0x58000400, 0x400),
         ("EXTI",    0x58000000, 0x400),
@@ -252,7 +248,6 @@ def main():
     if args.max_cycles > 0:
         config.max_instructions = args.max_cycles
 
-    # Breakpoints
     for bp in args.breakpoints:
         try:
             addr = int(bp, 0)
@@ -289,16 +284,13 @@ def main():
     # === Create system ===
     logger.info("INIT", "Creating system...")
 
-    # Memory bus
     bus = SystemBus()
     bus.trace_enabled = config.trace_bus
 
-    # CPU
     cpu = CortexM7(bus)
     cpu.trace_enabled = config.trace_cpu
     bus.set_exc_manager(cpu.exc_manager)
 
-    # Peripherals
     periphs = setup_peripherals(bus, cpu, config, logger)
 
     # === Load ROM ===
@@ -313,12 +305,31 @@ def main():
 
     logger.info("INIT", f"Loaded: {loaded}")
 
-    # Print vector table
-    vectors = bus.flash.get_vector_table()
-    logger.info("INIT", f"Initial SP:     0x{vectors['initial_sp']:08X}")
-    logger.info("INIT", f"Reset vector:   0x{vectors['reset']:08X}")
-    logger.info("INIT", f"NMI:            0x{vectors['nmi']:08X}")
-    logger.info("INIT", f"HardFault:      0x{vectors['hardfault']:08X}")
+    # Verify vector table is correct (read from Flash alias)
+    sp_check = bus.read32(0x00000000)
+    pc_check = bus.read32(0x00000004)
+    logger.info("INIT", f"Vector table check (via 0x00000000):")
+    logger.info("INIT", f"  Initial SP:     0x{sp_check:08X}")
+    logger.info("INIT", f"  Reset vector:   0x{pc_check:08X}")
+
+    # Also show from Flash directly
+    sp_flash = bus.read32(0x08000000)
+    pc_flash = bus.read32(0x08000004)
+    logger.info("INIT", f"Vector table (via 0x08000000):")
+    logger.info("INIT", f"  Initial SP:     0x{sp_flash:08X}")
+    logger.info("INIT", f"  Reset vector:   0x{pc_flash:08X}")
+
+    # Sanity check
+    if sp_check != sp_flash or pc_check != pc_flash:
+        logger.error("INIT", "Vector table mismatch! Boot alias not working correctly.")
+        logger.error("INIT", f"  Alias: SP=0x{sp_check:08X} PC=0x{pc_check:08X}")
+        logger.error("INIT", f"  Flash: SP=0x{sp_flash:08X} PC=0x{pc_flash:08X}")
+
+    # Validate vector table values
+    if not (0x20000000 <= sp_check <= 0x20020000):
+        logger.warn("INIT", f"SP 0x{sp_check:08X} doesn't look like DTCM address")
+    if not (0x08000000 <= (pc_check & 0xFFFFFFFE) <= 0x08200000):
+        logger.warn("INIT", f"Reset vector 0x{pc_check:08X} doesn't look like Flash address")
 
     # === Display ===
     display = None
@@ -339,23 +350,33 @@ def main():
         logger.info("INIT", "Keyboard input initialized")
 
     # === Reset CPU ===
-    logger.info("INIT", "Resetting CPU...")
+    # IMPORTANT: boot_from_flash must be True here so CPU reads
+    # correct vector table from Flash Bank1 alias
+    bus.set_boot_from_flash(True)
+    logger.info("INIT", "Resetting CPU (boot from Flash)...")
     cpu.reset()
-    logger.info("INIT", f"CPU started: PC=0x{cpu.regs.pc:08X} SP=0x{cpu.regs.sp:08X}")
+    logger.info("INIT", f"CPU after reset: PC=0x{cpu.regs.pc:08X} SP=0x{cpu.regs.sp:08X}")
+
+    # Now apply ITCM override (firmware will use this for fast code)
+    # The vector table is already read, so this is safe
+    bus.apply_itcm_override()
 
     # === Main Loop ===
     logger.info("RUN", "Entering main loop...")
+    logger.info("RUN", f"Target: {config.target_fps} FPS, "
+                       f"{config.cpu_cycles_per_frame} cycles/frame")
 
     running = True
     frame_count = 0
     total_cycles = 0
     start_time = time.time()
-    last_frame_time = start_time
     frame_interval = 1.0 / config.target_fps
     ltdc = periphs['ltdc']
-
-    # Cycles per frame
     cpf = config.cpu_cycles_per_frame
+
+    # Error tracking
+    consecutive_errors = 0
+    max_consecutive_errors = 100
 
     try:
         while running:
@@ -370,11 +391,12 @@ def main():
                         if event.key == _PYGAME_K_ESCAPE:
                             running = False
 
-                # Update input
                 kb.update()
 
             # --- Execute CPU cycles for one frame ---
             cycles_this_frame = 0
+            frame_errors = 0
+
             while cycles_this_frame < cpf:
                 # Check breakpoints
                 if config.breakpoints and cpu.regs.pc in config.breakpoints:
@@ -386,11 +408,26 @@ def main():
                 # Step CPU
                 try:
                     cycles = cpu.step()
+                    consecutive_errors = 0
                 except Exception as e:
-                    logger.error("CPU", f"Exception at PC=0x{cpu.regs.pc:08X}: {e}")
-                    logger.error("CPU", cpu.regs.dump())
-                    running = False
-                    break
+                    consecutive_errors += 1
+                    frame_errors += 1
+
+                    if consecutive_errors <= 5:
+                        logger.error("CPU",
+                                     f"Exception at PC=0x{cpu.regs.pc:08X}: {e}")
+
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error("CPU",
+                                     f"Too many consecutive errors "
+                                     f"({consecutive_errors}), stopping")
+                        logger.error("CPU", cpu.regs.dump())
+                        running = False
+                        break
+
+                    # Try to skip the problematic instruction
+                    cpu.regs.pc = (cpu.regs.pc + 2) & 0xFFFFFFFE
+                    cycles = 1
 
                 cycles_this_frame += cycles
                 total_cycles += cycles
@@ -398,20 +435,19 @@ def main():
                 # Tick SysTick
                 bus.tick_systick()
 
-                # Tick timers (every 64 cycles for performance)
-                if cycles_this_frame & 0x3F == 0:
+                # Tick timers periodically
+                if (cycles_this_frame & 0x3F) == 0:
                     for tname in ('tim1', 'tim2', 'tim3'):
                         periphs[tname].tick(64)
 
                 # Max cycles check
-                if config.max_instructions > 0 and total_cycles >= config.max_instructions:
+                if 0 < config.max_instructions <= total_cycles:
                     logger.info("RUN", f"Max cycles reached: {total_cycles}")
                     running = False
                     break
 
             # --- Render frame ---
             if display and display.is_active:
-                # Try to configure from LTDC
                 if ltdc.enabled:
                     display.configure_from_ltdc(ltdc)
 
@@ -450,6 +486,7 @@ def main():
         logger.info("EXIT", f"Emulated speed:   {total_cycles / elapsed / 1e6:.1f} MHz")
     logger.info("EXIT", f"Final PC:         0x{cpu.regs.pc:08X}")
     logger.info("EXIT", f"Final SP:         0x{cpu.regs.sp:08X}")
+    logger.info("EXIT", cpu.regs.dump())
     logger.info("EXIT", "=" * 50)
 
     if display:
@@ -459,14 +496,13 @@ def main():
     return 0
 
 
-# === Pygame helpers (avoid import at top level for headless) ===
-
+# === Pygame helpers ===
 _PYGAME_QUIT = None
 _PYGAME_KEYDOWN = None
 _PYGAME_K_ESCAPE = None
 
+
 def _get_pygame_events():
-    """Получить события pygame (ленивый импорт)."""
     global _PYGAME_QUIT, _PYGAME_KEYDOWN, _PYGAME_K_ESCAPE
     try:
         import pygame
